@@ -1,0 +1,4 @@
+interface:
+  display_name: "No-Clone Secret Broker"
+  short_description: "Use no-clone without exposing secret values"
+  default_prompt: "Use $no-clone to run the requested command with the repository secret bindings safely."
