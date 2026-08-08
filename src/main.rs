@@ -90,8 +90,9 @@ struct ProfileNameArgs {
 
 #[derive(Debug, Subcommand)]
 enum SecretCommand {
-    /// Add or replace a secret without printing its value.
-    Add(SecretAddArgs),
+    /// Create or replace a secret without printing its value.
+    #[command(alias = "add")]
+    Set(SecretSetArgs),
     /// List secret names without revealing values.
     List(ProfileNameArgs),
     /// Delete a secret.
@@ -101,7 +102,7 @@ enum SecretCommand {
 }
 
 #[derive(Debug, Args)]
-struct SecretAddArgs {
+struct SecretSetArgs {
     /// Profile that owns the secret.
     profile: String,
     /// Secret name referenced by manifests.
@@ -278,7 +279,7 @@ fn profile_command(command: ProfileCommand) -> Result<()> {
 
 fn secret_command(command: SecretCommand) -> Result<()> {
     match command {
-        SecretCommand::Add(args) => {
+        SecretCommand::Set(args) => {
             validate_name(&args.profile, "profile")?;
             validate_name(&args.name, "secret")?;
 

@@ -57,9 +57,9 @@ no-clone profile create registry
 Add secrets without displaying their values:
 
 ```text
-no-clone secret add production deploy-token --prompt
-no-clone secret add production database-password --prompt
-no-clone secret add registry password --prompt
+no-clone secret set production deploy-token --prompt
+no-clone secret set production database-password --prompt
+no-clone secret set registry password --prompt
 ```
 
 Inspect profiles and secret names safely:
