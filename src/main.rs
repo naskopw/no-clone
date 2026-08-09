@@ -31,6 +31,9 @@ struct Cli {
 enum Command {
     /// Create the encrypted local vault.
     Init,
+    /// Change the vault's master password.
+    #[command(alias = "passwd")]
+    ChangePassword,
     /// Manage named secret profiles.
     Profile {
         #[command(subcommand)]
@@ -204,6 +207,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Init => init_vault(),
+        Command::ChangePassword => change_password(),
         Command::Profile { command } => profile_command(command),
         Command::Secret { command } => secret_command(command),
         Command::Unlock(args) => unlock_command(args),
@@ -230,6 +234,24 @@ fn init_vault() -> Result<()> {
 
     println!("Initialized encrypted vault.");
     println!("Vault: {}", vault.path().display());
+    Ok(())
+}
+
+fn change_password() -> Result<()> {
+    let path = default_vault_path()?;
+    if !path.exists() {
+        bail!("vault not initialized; run `no-clone init` first");
+    }
+
+    let current_password = prompt_password("Current vault password: ")?;
+    let mut vault = Vault::open(&path, &current_password)?;
+    let new_password = prompt_new_password_with("New vault password")?;
+    vault.change_password(&new_password)?;
+    drop(vault);
+
+    // Verify the key persisted to disk before reporting success.
+    drop(Vault::open(&path, &new_password)?);
+    println!("Changed vault master password.");
     Ok(())
 }
 

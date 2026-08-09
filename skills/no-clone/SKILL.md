@@ -109,6 +109,7 @@ Leave these operations to the user unless the user explicitly changes the operat
 - **no-clone init**
 - **no-clone profile create**, **delete**, **render**, **export**, or **import**
 - **no-clone secret set**, **delete**, or **print**
+- **no-clone change-password**
 - **no-clone unlock**
 - **no-clone unlock PROFILE --zero-trust** when the user has not explicitly requested that session policy
 - **no-clone lock** when it would change the user's active sessions unexpectedly

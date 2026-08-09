@@ -113,6 +113,25 @@ impl Vault {
         &self.path
     }
 
+    pub fn change_password(&mut self, new_password: &str) -> Result<()> {
+        if new_password.is_empty() {
+            bail!("vault password cannot be empty");
+        }
+
+        self.connection
+            .pragma_update(None, "rekey", new_password)
+            .context("failed to change vault password")?;
+
+        // Confirm that this connection can still read the database after the
+        // rekey operation. The caller separately verifies the persisted key
+        // by reopening the file with the new password.
+        let _: i64 = self
+            .connection
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .context("could not verify changed vault password")?;
+        Ok(())
+    }
+
     pub fn create_profile(&mut self, name: &str, ttl_seconds: i64) -> Result<()> {
         let now = unix_time()?;
         self.connection
@@ -291,12 +310,16 @@ fn restrict_file_permissions(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
     fn test_path() -> PathBuf {
         std::env::temp_dir().join(format!(
-            "no-clone-vault-test-{}-{}.db",
+            "no-clone-vault-test-{}-{}-{}.db",
             std::process::id(),
-            unix_time().expect("clock should be available")
+            unix_time().expect("clock should be available"),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
         ))
     }
 
@@ -323,6 +346,29 @@ mod tests {
         }
 
         assert!(Vault::open(&path, "wrong password").is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn changes_password_without_losing_vault_data() {
+        let path = test_path();
+
+        {
+            let mut vault = Vault::create(&path, "old-password").unwrap();
+            vault.create_profile("production", 1800).unwrap();
+            vault
+                .put_secret("production", "token", &[0, 1, 2, 255])
+                .unwrap();
+            vault.change_password("new-password").unwrap();
+        }
+
+        assert!(Vault::open(&path, "old-password").is_err());
+        let vault = Vault::open(&path, "new-password").unwrap();
+        assert_eq!(
+            vault.get_secret("production", "token").unwrap().value,
+            vec![0, 1, 2, 255]
+        );
+
         fs::remove_file(path).unwrap();
     }
 }

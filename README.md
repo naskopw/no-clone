@@ -54,6 +54,16 @@ no-clone profile create production
 no-clone profile create registry
 ```
 
+Change the vault's master password at any time:
+
+```text
+no-clone change-password
+```
+
+The command asks for the current password, then the new password twice. The
+vault contents and profile unlock configuration are preserved; the old
+password no longer opens the vault.
+
 Add secrets without displaying their values:
 
 ```text
