@@ -1,78 +1,51 @@
 # no-clone
 
-### A local secret broker for AI-assisted command-line work
+`no-clone` is a local secret broker for command-line automation. It lets a
+command use credentials without putting their values in arguments, shell
+history, or the process that requested the command.
 
-`no-clone` lets an agent run commands that need credentials without putting the credential values into the agent's context.
+The project is early-stage software. It has not had a full independent
+security audit and should be evaluated carefully before use with production
+credentials.
 
-The user stores secrets in local profiles and explicitly unlocks the profiles needed for a task. A local broker then delivers selected secrets directly to the target process through stdin, file descriptors, or short-lived environment variables.
+## How it works
 
-The agent works with names and operation results. It does not need to handle the secret values.
+Secrets are stored in an encrypted SQLCipher database. A user unlocks one or
+more profiles, and the local broker keeps those profiles in memory for the
+duration of the session. When a command runs, the broker delivers only the
+secrets declared for that command.
 
-> **Status:** early implementation. The encrypted vault, profile and secret lifecycle, broker IPC, profile sessions, manifest-driven runs, transports, rendering, and encrypted profile transfer are implemented in this repository. The project is still pre-release and should not yet be treated as a production security product.
+- A **vault** stores encrypted profile data on the local machine.
+- A **profile** groups related secrets, such as `production` or `registry`.
+- A **manifest** describes the profiles, secret names, and transports required
+  by a command.
+- The **broker** manages unlocked profiles and launches commands with their
+  credentials.
 
-## The model
+The manifest contains names and delivery instructions, never secret values.
+
+## Installation
+
+Install from a local checkout with Cargo:
 
 ```text
-user unlocks a profile
-          ↓
-encrypted vault → in-memory broker
-                         ↓
-                 target process
+cargo install --path .
 ```
 
-`no-clone` is built around four concepts:
+The resulting `no-clone` executable is installed in Cargo's binary directory.
 
-- **Vault** — an encrypted SQLCipher database stored on the user's machine.
-- **Profile** — a named group of secrets, such as `production` or `registry`.
-- **Manifest** — a repository file that describes which profile secrets a command needs and how to deliver them.
-- **Broker** — a per-user background process that holds unlocked secrets in memory and launches target commands.
+## Quick start
 
-The manifest describes what a project needs. It is not what unlocks a profile. Unlocking is always an explicit user action.
-
-## Features
-
-- Encrypted local storage with SQLCipher-backed SQLite.
-- Cross-platform Rust application for Windows, macOS, and Linux.
-- User-controlled profile unlocking and locking.
-- Independent expiration for each unlocked profile.
-- Optional zero-trust sessions requiring the vault password for every delivery.
-- No automatic unlocking.
-- Local background broker with protected cross-platform IPC.
-- Multiple secret transports: stdin, file descriptors on Unix, and environment variables.
-- Repository manifests with multiple profiles and secret bindings.
-- User-authorized rendering to dotenv, JSON, and YAML.
-- Encrypted profile import and export.
-- No output redaction or post-delivery claims that the target cannot disclose its inputs.
-
-## Typical workflow
-
-### Set up the vault
+Create a vault and a profile, then add secrets through hidden prompts:
 
 ```text
 no-clone init
 no-clone profile create production
-no-clone profile create registry
-```
-
-Change the vault's master password at any time:
-
-```text
-no-clone change-password
-```
-
-The command asks for the current password, then the new password twice. The
-vault contents and profile unlock configuration are preserved; the old
-password no longer opens the vault.
-
-Add secrets without displaying their values:
-
-```text
 no-clone secret set production deploy-token --prompt
 no-clone secret set production database-password --prompt
-no-clone secret set registry password --prompt
 ```
 
-Inspect profiles and secret names safely:
+Profiles and secret names can be listed without revealing their values:
 
 ```text
 no-clone profile list
@@ -80,9 +53,36 @@ no-clone secret list production
 no-clone status
 ```
 
-### Define project bindings
+Unlocking is an explicit user action. It starts the per-user broker when
+needed and loads the selected profiles into memory:
 
-A repository can contain a `.no-clone.yaml` file:
+```text
+no-clone unlock production
+```
+
+A command can then use a repository manifest:
+
+```text
+no-clone run --manifest .no-clone.yaml -- ./deploy.sh
+```
+
+Lock profiles when the work is finished:
+
+```text
+no-clone lock production
+```
+
+Profiles can also be unlocked in zero-trust mode. In that mode, the vault
+password is required again before each delivery:
+
+```text
+no-clone unlock production --zero-trust
+```
+
+## Manifests
+
+A `.no-clone.yaml` file declares how named secrets should reach the target
+process:
 
 ```yaml
 version: 1
@@ -105,35 +105,15 @@ profiles:
         target: REGISTRY_PASSWORD
 ```
 
-The manifest contains secret names and delivery instructions, never secret values. It is safe to keep with the project source, subject to normal review of project configuration.
+The supported transports are:
 
-### Unlock and run
+| Transport | Use when |
+| --- | --- |
+| `stdin` | The command reads a credential from standard input. |
+| `fd` | The command can read a dedicated inherited file descriptor. Unix only. |
+| `env` | The command requires a named environment variable. |
 
-The user unlocks the profiles in a separate terminal:
-
-```text
-no-clone unlock production registry
-```
-
-This starts the per-user broker if needed, prompts for the vault password, and loads the selected profiles into memory. The unlock command returns when the broker is ready.
-
-For profiles that should require user authorization on every delivery:
-
-```text
-no-clone unlock production --zero-trust
-```
-
-Zero-trust profiles remain unlocked in memory, but every `run` that uses one requires the vault password again before the target starts. The run displays the profile names and command context before prompting. Agents must never provide this password.
-
-The agent can then run the project command:
-
-```text
-no-clone run --manifest .no-clone.yaml -- ./deploy.sh
-```
-
-The broker checks that all referenced profiles are unlocked, creates the requested transports, launches `./deploy.sh`, and returns its output and exit status. The CLI process used by the agent never receives the secret values.
-
-For a one-off command, bindings can be supplied directly:
+For a one-off command, bindings can be supplied on the command line:
 
 ```text
 no-clone run production \
@@ -142,141 +122,64 @@ no-clone run production \
   -- ./deploy.sh
 ```
 
-When the task is finished:
+## Passwords and profiles
+
+The vault password is never stored. Each profile has its own expiration time,
+and expired profiles are removed from the broker's active memory. Running
+commands do not unlock profiles automatically.
+
+Change the vault password with:
 
 ```text
-no-clone lock production registry
+no-clone change-password
 ```
 
-## Profiles expire independently
+The command verifies the current password and preserves the vault contents.
 
-Each profile has its own unlock lifetime:
+Profiles can be transferred between trusted installations as encrypted
+bundles:
 
 ```text
-PROFILE       STATUS       AUTH          EXPIRES
-production    unlocked     zero-trust    24m 12s
-registry      unlocked     standard      09m 12s
+no-clone profile export production --output production.no-clone
+no-clone profile import production.no-clone --as production
 ```
 
-When a profile expires, the broker removes it from active memory and rejects new requests that need it. Expiration does not revoke a credential already delivered to a running target process.
+## Rendering and security
 
-`run` never unlocks a profile automatically. A locked or expired profile is an error until the user explicitly unlocks it again. A zero-trust profile additionally requires the vault password for each delivery.
-
-## Secret transports
-
-The manifest chooses the transport required by the target application.
-
-| Transport | Use when |
-| --- | --- |
-| `stdin` | The application reads a credential from standard input. |
-| `fd` | The application can read a dedicated inherited file descriptor; currently Unix-only. |
-| `env` | The application requires a specific environment-variable name. |
-
-Environment variables are scoped to the target process tree. They are never exported into the agent's shell.
-
-## Plaintext rendering
-
-Direct process delivery is the normal path. Rendering is an explicit user-authorized escape hatch for applications that need a file or for preparing configuration manually.
-
-Rendering does not use a repository manifest:
+Direct process delivery is the preferred workflow. Rendering is available for
+applications that require a configuration file:
 
 ```text
-no-clone profile render production \
-  --format dotenv \
-  --output .env
+no-clone profile render production --format dotenv --output .env
+no-clone profile render production --format json --output secrets.json
+no-clone profile render production --format yaml --stdout
 ```
 
-Structured formats are also supported:
-
-```text
-no-clone profile render production \
-  --format json \
-  --output secrets.json
-
-no-clone profile render production \
-  --format yaml \
-  --stdout
-```
-
-Rendering and single-secret reveal require the vault password again, even if the profile is already unlocked. Non-interactive rendering is rejected by default.
-
-To intentionally reveal one raw secret:
+Rendering and single-secret printing require a fresh vault-password prompt:
 
 ```text
 no-clone secret print production database-password
 ```
 
-For dotenv output, names are converted best-effort:
+Rendered files contain plaintext credentials and should be protected and kept
+out of version control.
+
+The broker uses protected per-user local IPC. Environment variables are set
+only for the target process tree. After a credential has been delivered,
+`no-clone` cannot stop the target from logging, copying, or disclosing it, and
+it does not redact target stdout or stderr.
+
+## Development
+
+Run the test suite with:
 
 ```text
-database-password → DATABASE_PASSWORD
-tls.cert          → TLS_CERT
-2fa-token         → _2FA_TOKEN
+cargo test
 ```
 
-The conversion uppercases names, replaces non-alphanumeric characters with underscores, collapses repeated underscores, and prefixes names that begin with a digit. Invalid or colliding names cause the operation to fail.
+The repository also contains the integration guide used by compatible command
+automation tools at [skills/no-clone/SKILL.md](skills/no-clone/SKILL.md).
 
-Rendered files contain plaintext secrets. They should be protected, kept out of version control, and removed when no longer needed.
+## License
 
-## Encrypted profile transfer
-
-Profiles can be moved between trusted `no-clone` installations as encrypted bundles:
-
-```text
-no-clone profile export production \
-  --output production.no-clone
-
-no-clone profile import production.no-clone \
-  --as production
-```
-
-Export asks for a new bundle password. Import asks for the bundle password and then the destination vault password. Profile bundles contain encrypted profile data and metadata. They do not contain repository manifests and are never printed as plaintext.
-
-## Storage and broker
-
-The vault is a SQLCipher-encrypted SQLite database. Plain SQLite is never used for secret storage.
-
-The vault password is not stored. The broker opens the encrypted database after the user unlocks a profile and keeps the active profile data in memory until it is locked or expires.
-
-The broker is a per-user background process, not a system-wide service. The CLI communicates with it through protected local IPC:
-
-- Unix domain sockets on Linux and macOS;
-- a protected named pipe on Windows.
-
-If the broker exits, unlocked state is lost. No plaintext profile data is written to disk as part of the unlock session.
-
-SQLCipher is bundled with the Rust application and opened with SQLCipher compatibility settings equivalent to version 4. The dependency is locked in `Cargo.lock` so vault files remain portable across supported builds.
-
-## Security boundary
-
-`no-clone` protects secrets from the agent until delivery to the target process. After delivery, the target application owns the responsibility for handling its inputs.
-
-`no-clone` does not inspect, rewrite, or redact target stdout and stderr. If a target prints a secret, that output may be visible to the agent. Likewise, rendering a plaintext `.env` file intentionally places the secret where other processes can read it.
-
-The tool is designed to prevent routine or accidental agent exposure. It is not a defense against a malicious target command or a malicious process with unrestricted access to the same operating-system account.
-
-## Agent rules
-
-Agents using `no-clone` should:
-
-- use profile and secret names, never raw values;
-- use the repository manifest for normal execution;
-- never ask the user to paste a secret into chat;
-- never read protected secret files directly;
-- never place secrets in arguments, prompts, generated files, or shell history;
-- never unlock profiles;
-- never invoke plaintext rendering or reveal during normal execution;
-- prefer stdin or file descriptors when supported;
-- lock profiles or let them expire after the task.
-
-The repository also ships an agent skill at [skills/no-clone/SKILL.md](skills/no-clone/SKILL.md). It teaches compatible agents to use manifests and `no-clone run` without requesting, reading, or printing secret values.
-
-## Why the name?
-
-The name is inspired by blind computation and the no-cloning theorem from quantum information science. In blind computation, one party provides private input to another party, which performs a computation without learning the underlying input. `no-clone` applies a similar idea to agent-driven workflows: the user owns the secret, the agent requests an operation by name, and the required process receives the value without the agent needing to copy it into its own context.
-
-`no-clone` does not use quantum cryptography. The name describes the intended privacy boundary, not the underlying implementation.
-
-## Current implementation status
-
-The current prototype includes the core workflow described above. It is not yet a packaged release: installation/distribution, Windows-specific FD delivery, migration tooling, and a broader security audit still need to be completed.
+MIT. See [LICENSE](LICENSE).

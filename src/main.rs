@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 #[command(
     name = "no-clone",
     version,
-    about = "Use secrets without copying them into the agent's view"
+    about = "Run commands with credentials kept out of the command line"
 )]
 struct Cli {
     #[command(subcommand)]
