@@ -1,4 +1,5 @@
 mod broker;
+mod fingerprint;
 mod manifest;
 mod vault;
 
@@ -12,6 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use fingerprint::VerificationStatus;
 use manifest::{Manifest, ProfileManifest, parse_cli_binding};
 use vault::{Vault, VaultSecret, default_vault_path};
 use zeroize::Zeroizing;
@@ -52,6 +54,11 @@ enum Command {
     Status,
     /// Run a command with bindings supplied by a repository manifest or CLI flags.
     Run(RunArgs),
+    /// Manage vault fingerprint keys.
+    Fingerprint {
+        #[command(subcommand)]
+        command: FingerprintCommand,
+    },
     /// Internal foreground broker entry point.
     #[command(hide = true)]
     Broker {
@@ -74,6 +81,12 @@ enum ProfileCommand {
     Export(ProfileExportArgs),
     /// Import an encrypted profile bundle.
     Import(ProfileImportArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum FingerprintCommand {
+    /// Rotate the vault fingerprint key and invalidate all existing fingerprints.
+    RotateKey,
 }
 
 #[derive(Debug, Args)]
@@ -100,6 +113,10 @@ enum SecretCommand {
     List(ProfileNameArgs),
     /// Delete a secret.
     Delete(SecretNameArgs),
+    /// Generate a vault-keyed fingerprint for a stored secret.
+    Fingerprint(SecretNameArgs),
+    /// Verify a vault-keyed fingerprint without revealing the secret.
+    Verify(SecretVerifyArgs),
     /// Explicitly print one secret after a fresh vault-password prompt.
     Print(SecretNameArgs),
 }
@@ -124,6 +141,17 @@ struct SecretNameArgs {
     profile: String,
     /// Secret name.
     name: String,
+}
+
+#[derive(Debug, Args)]
+struct SecretVerifyArgs {
+    /// Profile that owns the secret.
+    profile: String,
+    /// Secret name.
+    name: String,
+    /// Expected vault-keyed fingerprint token.
+    #[arg(long, value_name = "TOKEN")]
+    fingerprint: String,
 }
 
 #[derive(Debug, Args)]
@@ -214,6 +242,7 @@ fn main() -> Result<()> {
         Command::Lock(args) => lock_command(args),
         Command::Status => status_command(),
         Command::Run(args) => run_command(args),
+        Command::Fingerprint { command } => fingerprint_command(command),
         Command::Broker { foreground } => {
             if !foreground {
                 bail!("the broker command is for internal use");
@@ -347,8 +376,75 @@ fn secret_command(command: SecretCommand) -> Result<()> {
             println!("Deleted secret '{}/{}'.", args.profile, args.name);
             Ok(())
         }
+        SecretCommand::Fingerprint(args) => fingerprint_secret(args),
+        SecretCommand::Verify(args) => verify_secret(args),
         SecretCommand::Print(args) => print_secret(args),
     }
+}
+
+fn fingerprint_command(command: FingerprintCommand) -> Result<()> {
+    match command {
+        FingerprintCommand::RotateKey => rotate_fingerprint_key(),
+    }
+}
+
+fn fingerprint_secret(args: SecretNameArgs) -> Result<()> {
+    validate_name(&args.profile, "profile")?;
+    validate_name(&args.name, "secret")?;
+    let vault = open_vault()?;
+    let key = vault.fingerprint_key()?;
+    let secret = vault.get_secret(&args.profile, &args.name)?;
+    let token = fingerprint::token_for(&key, &args.profile, &args.name, &secret.value);
+    println!("{token}");
+    Ok(())
+}
+
+fn verify_secret(args: SecretVerifyArgs) -> Result<()> {
+    if let Err(error) = validate_name(&args.profile, "profile") {
+        eprintln!("{error:#}");
+        process::exit(2);
+    }
+    if let Err(error) = validate_name(&args.name, "secret") {
+        eprintln!("{error:#}");
+        process::exit(2);
+    }
+
+    let status = match broker::verify_fingerprint(args.profile, args.name, args.fingerprint) {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("{error:#}");
+            process::exit(2);
+        }
+    };
+
+    match status {
+        VerificationStatus::Match => println!("match"),
+        VerificationStatus::Mismatch => {
+            println!("mismatch");
+            process::exit(1);
+        }
+        VerificationStatus::Stale => {
+            println!("stale");
+            process::exit(3);
+        }
+        VerificationStatus::Missing => {
+            println!("missing");
+            process::exit(4);
+        }
+    }
+    Ok(())
+}
+
+fn rotate_fingerprint_key() -> Result<()> {
+    eprintln!("WARNING: this permanently invalidates all existing fingerprints.");
+    let confirmation = prompt_password("Type 'rotate' to continue: ")?;
+    if confirmation.trim() != "rotate" {
+        bail!("fingerprint key rotation cancelled");
+    }
+    let password = prompt_password("Vault password: ")?;
+    broker::rotate_fingerprint_key(password)?;
+    println!("Rotated the vault fingerprint key; existing fingerprints are now stale.");
+    Ok(())
 }
 
 fn render_profile(args: ProfileRenderArgs) -> Result<()> {

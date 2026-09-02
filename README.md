@@ -53,6 +53,22 @@ no-clone secret list production
 no-clone status
 ```
 
+Create a vault-keyed fingerprint for an existing secret and give the token to
+an agent as an expected-value check:
+
+```text
+no-clone secret fingerprint production deploy-token
+no-clone secret verify production deploy-token \
+  --fingerprint nc-fp-v1.<key-id>.<tag>
+```
+
+Fingerprint generation prompts for the vault password and prints only the
+token. Verification requires the profile to be unlocked, returns `match`,
+`mismatch`, `stale`, or `missing`, and never exposes the secret. Fingerprints
+are bound to the vault, profile, secret name, and exact secret bytes; they do
+not expire. Verification is autonomous for zero-trust profiles because it
+does not deliver the secret.
+
 Unlocking is an explicit user action. It starts the per-user broker when
 needed and loads the selected profiles into memory:
 
@@ -161,13 +177,23 @@ Rendering and single-secret printing require a fresh vault-password prompt:
 no-clone secret print production database-password
 ```
 
+Fingerprint keys can be rotated as an explicit recovery action. Rotation
+requires a warning confirmation and the vault password, and permanently
+invalidates every previously generated fingerprint:
+
+```text
+no-clone fingerprint rotate-key
+```
+
 Rendered files contain plaintext credentials and should be protected and kept
 out of version control.
 
 The broker uses protected per-user local IPC. Environment variables are set
 only for the target process tree. After a credential has been delivered,
 `no-clone` cannot stop the target from logging, copying, or disclosing it, and
-it does not redact target stdout or stderr.
+it does not redact target stdout or stderr. Fingerprints are keyed HMAC tags,
+not credentials; they are safe to share with an agent but cannot be used to
+retrieve a secret or authenticate to the underlying service.
 
 ## Development
 

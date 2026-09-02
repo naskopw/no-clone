@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
+    fingerprint::{self, VerificationStatus},
     manifest::{Binding, Manifest, Target, Transport, target_as_fd},
     vault::{Vault, VaultSecret, default_vault_path},
 };
@@ -32,6 +33,14 @@ pub enum Request {
         profiles: Vec<String>,
     },
     Status,
+    VerifyFingerprint {
+        profile: String,
+        secret: String,
+        fingerprint: String,
+    },
+    RotateFingerprintKey {
+        password: String,
+    },
     Run {
         manifest: Manifest,
         command: Vec<String>,
@@ -46,6 +55,9 @@ pub enum Response {
     Ok,
     Status {
         profiles: Vec<ProfileStatus>,
+    },
+    FingerprintStatus {
+        status: VerificationStatus,
     },
     PasswordRequired {
         profiles: Vec<String>,
@@ -70,6 +82,7 @@ pub struct ProfileStatus {
 #[derive(Debug, Default)]
 struct SessionState {
     profiles: HashMap<String, ActiveProfile>,
+    fingerprint_key: Option<fingerprint::FingerprintKey>,
 }
 
 #[derive(Debug)]
@@ -77,6 +90,12 @@ struct ActiveProfile {
     expires_at: i64,
     zero_trust: bool,
     secrets: HashMap<String, Zeroizing<Vec<u8>>>,
+}
+
+struct PreparedUnlock {
+    vault: Vault,
+    profiles: BTreeMap<String, ActiveProfile>,
+    now: i64,
 }
 
 #[cfg(unix)]
@@ -123,6 +142,34 @@ pub fn status() -> Result<Vec<ProfileStatus>> {
         Response::Status { profiles } => Ok(profiles),
         response => unexpected_response(response),
     }
+}
+
+pub fn verify_fingerprint(
+    profile: String,
+    secret: String,
+    fingerprint: String,
+) -> Result<VerificationStatus> {
+    ensure_running()?;
+    match send(&Request::VerifyFingerprint {
+        profile,
+        secret,
+        fingerprint,
+    })? {
+        Response::FingerprintStatus { status } => Ok(status),
+        response => unexpected_response(response),
+    }
+}
+
+pub fn rotate_fingerprint_key(password: Zeroizing<String>) -> Result<()> {
+    ensure_running()?;
+    let mut request = Request::RotateFingerprintKey {
+        password: password.to_string(),
+    };
+    let response = send(&request);
+    if let Request::RotateFingerprintKey { password } = &mut request {
+        password.zeroize();
+    }
+    expect_ok(response?)
 }
 
 pub fn run(
@@ -189,6 +236,7 @@ pub fn run_foreground() -> Result<()> {
         .create_sync()
         .context("could not start the broker; another broker may already be running")?;
     let state = Arc::new(Mutex::new(SessionState::default()));
+    start_expiry_reaper(&state)?;
     let vault_path = default_vault_path()?;
 
     for connection in listener.incoming() {
@@ -284,6 +332,14 @@ fn dispatch(
         ),
         Request::Lock { profiles } => lock_profiles(state, &profiles),
         Request::Status => status_profiles(state),
+        Request::VerifyFingerprint {
+            profile,
+            secret,
+            fingerprint,
+        } => verify_fingerprint_value(state, &profile, &secret, &fingerprint),
+        Request::RotateFingerprintKey { password } => {
+            rotate_fingerprint_key_value(state, vault_path, password)
+        }
         Request::Run {
             manifest,
             command,
@@ -308,6 +364,17 @@ fn unlock_profiles(
     zero_trust: bool,
     password: String,
 ) -> Result<Response> {
+    let prepared = prepare_unlock(vault_path, profiles, ttl_override, zero_trust, password)?;
+    install_unlocked_profiles(state, prepared)
+}
+
+fn prepare_unlock(
+    vault_path: &std::path::Path,
+    profiles: Vec<String>,
+    ttl_override: Option<i64>,
+    zero_trust: bool,
+    password: String,
+) -> Result<PreparedUnlock> {
     let password = Zeroizing::new(password);
     let vault = Vault::open(vault_path, &password)?;
     let now = unix_time()?;
@@ -330,18 +397,39 @@ fn unlock_profiles(
         );
     }
 
+    Ok(PreparedUnlock {
+        vault,
+        profiles: loaded,
+        now,
+    })
+}
+
+fn install_unlocked_profiles(
+    state: &Arc<Mutex<SessionState>>,
+    prepared: PreparedUnlock,
+) -> Result<Response> {
+    let PreparedUnlock {
+        vault,
+        mut profiles,
+        now,
+    } = prepared;
     let mut state = state
         .lock()
         .map_err(|_| anyhow::anyhow!("broker state is unavailable"))?;
+    // Read the key while holding the same lock used by rotation. Otherwise an
+    // unlock that started before a rotation could install the old key after
+    // the rotation had already completed.
+    let fingerprint_key = vault.fingerprint_key()?;
     purge_expired(&mut state, now);
-    for (name, profile) in &mut loaded {
+    for (name, profile) in &mut profiles {
         if let Some(existing) = state.profiles.get(name)
             && existing.zero_trust
         {
             profile.zero_trust = true;
         }
     }
-    state.profiles.extend(loaded);
+    state.profiles.extend(profiles);
+    state.fingerprint_key = Some(fingerprint_key);
     Ok(Response::Ok)
 }
 
@@ -355,6 +443,9 @@ fn lock_profiles(state: &Arc<Mutex<SessionState>>, profiles: &[String]) -> Resul
         for profile in profiles {
             state.profiles.remove(profile);
         }
+    }
+    if state.profiles.is_empty() {
+        state.fingerprint_key = None;
     }
     Ok(Response::Ok)
 }
@@ -375,6 +466,53 @@ fn status_profiles(state: &Arc<Mutex<SessionState>>) -> Result<Response> {
         .collect::<Vec<_>>();
     profiles.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(Response::Status { profiles })
+}
+
+fn verify_fingerprint_value(
+    state: &Arc<Mutex<SessionState>>,
+    profile: &str,
+    secret: &str,
+    token: &str,
+) -> Result<Response> {
+    let mut state = state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("broker state is unavailable"))?;
+    purge_expired(&mut state, unix_time()?);
+
+    let Some(active_profile) = state.profiles.get(profile) else {
+        bail!("profile '{profile}' is locked or expired; run no-clone unlock {profile} first");
+    };
+    let Some(value) = active_profile.secrets.get(secret) else {
+        return Ok(Response::FingerprintStatus {
+            status: VerificationStatus::Missing,
+        });
+    };
+    let key = state
+        .fingerprint_key
+        .as_ref()
+        .context("broker fingerprint key is unavailable")?;
+    let status = fingerprint::verify_token(key, profile, secret, value, token)?;
+    Ok(Response::FingerprintStatus { status })
+}
+
+fn rotate_fingerprint_key_value(
+    state: &Arc<Mutex<SessionState>>,
+    vault_path: &std::path::Path,
+    password: String,
+) -> Result<Response> {
+    let password = Zeroizing::new(password);
+    let mut state = state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("broker state is unavailable"))?;
+    purge_expired(&mut state, unix_time()?);
+    let mut vault = Vault::open(vault_path, &password).context("vault password rejected")?;
+    let fingerprint_key = vault.rotate_fingerprint_key()?;
+    state.fingerprint_key = if state.profiles.is_empty() {
+        None
+    } else {
+        Some(fingerprint_key)
+    };
+    Ok(Response::Ok)
 }
 
 fn run_target(
@@ -647,6 +785,39 @@ fn set_cloexec(fd: i32) -> Result<()> {
 
 fn purge_expired(state: &mut SessionState, now: i64) {
     state.profiles.retain(|_, profile| profile.expires_at > now);
+    if state.profiles.is_empty() {
+        state.fingerprint_key = None;
+    }
+}
+
+fn start_expiry_reaper(state: &Arc<Mutex<SessionState>>) -> Result<()> {
+    start_expiry_reaper_with_interval(state, Duration::from_secs(1))
+}
+
+fn start_expiry_reaper_with_interval(
+    state: &Arc<Mutex<SessionState>>,
+    interval: Duration,
+) -> Result<()> {
+    let state = Arc::downgrade(state);
+    let _handle = thread::Builder::new()
+        .name(String::from("no-clone-expiry-reaper"))
+        .spawn(move || {
+            loop {
+                thread::sleep(interval);
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                let Ok(now) = unix_time() else {
+                    continue;
+                };
+                let Ok(mut state) = state.lock() else {
+                    return;
+                };
+                purge_expired(&mut state, now);
+            }
+        })
+        .context("could not start the broker expiry reaper")?;
+    Ok(())
 }
 
 fn ensure_running() -> Result<()> {
@@ -757,6 +928,7 @@ fn unix_time() -> Result<i64> {
 mod tests {
     use super::*;
     use crate::manifest::{Binding, ProfileManifest};
+    use std::time::Instant;
 
     #[cfg(unix)]
     #[test]
@@ -846,5 +1018,229 @@ mod tests {
             ),
             Response::Ok
         ));
+    }
+
+    #[test]
+    fn fingerprint_verification_reports_statuses_and_rotation() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let vault_path = temporary_directory.path().join("vault.db");
+        let mut vault = Vault::create(&vault_path, "test-password").unwrap();
+        vault.create_profile("production", 300).unwrap();
+        vault
+            .put_secret("production", "token", b"secret-value")
+            .unwrap();
+        let old_key = vault.fingerprint_key().unwrap();
+        let old_token = fingerprint::token_for(&old_key, "production", "token", b"secret-value");
+        drop(vault);
+
+        let state = Arc::new(Mutex::new(SessionState::default()));
+        assert!(matches!(
+            dispatch(
+                Request::Unlock {
+                    profiles: vec![String::from("production")],
+                    ttl_seconds: None,
+                    zero_trust: true,
+                    password: String::from("test-password"),
+                },
+                &state,
+                &vault_path,
+            ),
+            Response::Ok
+        ));
+
+        assert!(matches!(
+            dispatch(
+                Request::VerifyFingerprint {
+                    profile: String::from("production"),
+                    secret: String::from("token"),
+                    fingerprint: old_token.clone(),
+                },
+                &state,
+                &vault_path,
+            ),
+            Response::FingerprintStatus {
+                status: VerificationStatus::Match
+            }
+        ));
+        assert!(matches!(
+            dispatch(
+                Request::VerifyFingerprint {
+                    profile: String::from("production"),
+                    secret: String::from("token"),
+                    fingerprint: fingerprint::token_for(
+                        &old_key,
+                        "production",
+                        "token",
+                        b"different"
+                    ),
+                },
+                &state,
+                &vault_path,
+            ),
+            Response::FingerprintStatus {
+                status: VerificationStatus::Mismatch
+            }
+        ));
+        assert!(matches!(
+            dispatch(
+                Request::VerifyFingerprint {
+                    profile: String::from("production"),
+                    secret: String::from("missing"),
+                    fingerprint: old_token.clone(),
+                },
+                &state,
+                &vault_path,
+            ),
+            Response::FingerprintStatus {
+                status: VerificationStatus::Missing
+            }
+        ));
+
+        assert!(matches!(
+            dispatch(
+                Request::RotateFingerprintKey {
+                    password: String::from("test-password"),
+                },
+                &state,
+                &vault_path,
+            ),
+            Response::Ok
+        ));
+        assert!(matches!(
+            dispatch(
+                Request::VerifyFingerprint {
+                    profile: String::from("production"),
+                    secret: String::from("token"),
+                    fingerprint: old_token,
+                },
+                &state,
+                &vault_path,
+            ),
+            Response::FingerprintStatus {
+                status: VerificationStatus::Stale
+            }
+        ));
+    }
+
+    #[test]
+    fn prepared_unlock_observes_rotation_before_installing_key() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let vault_path = temporary_directory.path().join("vault.db");
+        let mut vault = Vault::create(&vault_path, "test-password").unwrap();
+        vault.create_profile("production", 300).unwrap();
+        vault
+            .put_secret("production", "token", b"secret-value")
+            .unwrap();
+        let old_key = vault.fingerprint_key().unwrap();
+        let old_token = fingerprint::token_for(&old_key, "production", "token", b"secret-value");
+        drop(vault);
+
+        let prepared = prepare_unlock(
+            &vault_path,
+            vec![String::from("production")],
+            None,
+            false,
+            String::from("test-password"),
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(SessionState::default()));
+
+        assert!(matches!(
+            dispatch(
+                Request::RotateFingerprintKey {
+                    password: String::from("test-password"),
+                },
+                &state,
+                &vault_path,
+            ),
+            Response::Ok
+        ));
+        assert!(matches!(
+            install_unlocked_profiles(&state, prepared),
+            Ok(Response::Ok)
+        ));
+        assert!(matches!(
+            dispatch(
+                Request::VerifyFingerprint {
+                    profile: String::from("production"),
+                    secret: String::from("token"),
+                    fingerprint: old_token,
+                },
+                &state,
+                &vault_path,
+            ),
+            Response::FingerprintStatus {
+                status: VerificationStatus::Stale
+            }
+        ));
+    }
+
+    #[test]
+    fn expiry_reaper_drops_last_profile_and_fingerprint_key() {
+        let state = Arc::new(Mutex::new(SessionState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            state.profiles.insert(
+                String::from("expired"),
+                ActiveProfile {
+                    expires_at: unix_time().unwrap(),
+                    zero_trust: false,
+                    secrets: HashMap::new(),
+                },
+            );
+            state.fingerprint_key = Some(fingerprint::FingerprintKey::generate());
+        }
+        start_expiry_reaper_with_interval(&state, Duration::from_millis(5)).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let cleaned = {
+                let state = state.lock().unwrap();
+                state.profiles.is_empty() && state.fingerprint_key.is_none()
+            };
+            if cleaned {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expiry reaper did not clean broker state"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn rotation_does_not_retain_key_for_expired_profiles() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let vault_path = temporary_directory.path().join("vault.db");
+        drop(Vault::create(&vault_path, "test-password").unwrap());
+
+        let state = Arc::new(Mutex::new(SessionState::default()));
+        {
+            let mut state = state.lock().unwrap();
+            state.profiles.insert(
+                String::from("expired"),
+                ActiveProfile {
+                    expires_at: unix_time().unwrap(),
+                    zero_trust: false,
+                    secrets: HashMap::new(),
+                },
+            );
+            state.fingerprint_key = Some(fingerprint::FingerprintKey::generate());
+        }
+
+        assert!(matches!(
+            dispatch(
+                Request::RotateFingerprintKey {
+                    password: String::from("test-password"),
+                },
+                &state,
+                &vault_path,
+            ),
+            Response::Ok
+        ));
+        let state = state.lock().unwrap();
+        assert!(state.profiles.is_empty());
+        assert!(state.fingerprint_key.is_none());
     }
 }

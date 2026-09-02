@@ -9,6 +9,8 @@ use directories::ProjectDirs;
 use rusqlite::{Connection, OptionalExtension, params};
 use zeroize::Zeroize;
 
+use crate::fingerprint::{FingerprintKey, KEY_ID_LENGTH, KEY_LENGTH};
+
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
 
@@ -30,6 +32,12 @@ CREATE TABLE IF NOT EXISTS secrets (
 );
 
 CREATE INDEX IF NOT EXISTS secrets_profile_id_idx ON secrets(profile_id);
+
+CREATE TABLE IF NOT EXISTS vault_metadata (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    fingerprint_key BLOB NOT NULL,
+    fingerprint_key_id BLOB NOT NULL
+);
 "#;
 
 pub fn default_vault_path() -> Result<PathBuf> {
@@ -79,6 +87,15 @@ impl Vault {
             .with_context(|| format!("failed to create vault at {}", path.display()))?;
         configure_connection(&connection, password)?;
         connection.execute_batch(SCHEMA)?;
+        let fingerprint_key = FingerprintKey::generate();
+        connection.execute(
+            "INSERT INTO vault_metadata (id, fingerprint_key, fingerprint_key_id)
+             VALUES (1, ?1, ?2)",
+            params![
+                fingerprint_key.key_bytes(),
+                fingerprint_key.key_id().as_slice()
+            ],
+        )?;
         restrict_file_permissions(path)?;
 
         Ok(Self {
@@ -130,6 +147,38 @@ impl Vault {
             .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
             .context("could not verify changed vault password")?;
         Ok(())
+    }
+
+    pub fn fingerprint_key(&self) -> Result<FingerprintKey> {
+        let (key, key_id): (Vec<u8>, Vec<u8>) = self
+            .connection
+            .query_row(
+                "SELECT fingerprint_key, fingerprint_key_id FROM vault_metadata WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .context("vault fingerprint key is missing")?;
+        if key.len() != KEY_LENGTH || key_id.len() != KEY_ID_LENGTH {
+            bail!("vault fingerprint key has invalid metadata");
+        }
+        FingerprintKey::from_parts(key, key_id)
+    }
+
+    pub fn rotate_fingerprint_key(&mut self) -> Result<FingerprintKey> {
+        let fingerprint_key = FingerprintKey::generate();
+        let transaction = self.connection.transaction()?;
+        let updated = transaction.execute(
+            "UPDATE vault_metadata SET fingerprint_key = ?1, fingerprint_key_id = ?2 WHERE id = 1",
+            params![
+                fingerprint_key.key_bytes(),
+                fingerprint_key.key_id().as_slice()
+            ],
+        )?;
+        if updated != 1 {
+            bail!("vault fingerprint key is missing");
+        }
+        transaction.commit()?;
+        Ok(fingerprint_key)
     }
 
     pub fn create_profile(&mut self, name: &str, ttl_seconds: i64) -> Result<()> {
@@ -368,6 +417,26 @@ mod tests {
             vault.get_secret("production", "token").unwrap().value,
             vec![0, 1, 2, 255]
         );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fingerprint_key_survives_password_change_and_rotates() {
+        let path = test_path();
+
+        let original_id = {
+            let mut vault = Vault::create(&path, "old-password").unwrap();
+            let original_id = *vault.fingerprint_key().unwrap().key_id();
+            vault.change_password("new-password").unwrap();
+            original_id
+        };
+
+        let mut vault = Vault::open(&path, "new-password").unwrap();
+        assert_eq!(*vault.fingerprint_key().unwrap().key_id(), original_id);
+        let rotated_id = *vault.rotate_fingerprint_key().unwrap().key_id();
+        assert_ne!(rotated_id, original_id);
+        assert_eq!(*vault.fingerprint_key().unwrap().key_id(), rotated_id);
 
         fs::remove_file(path).unwrap();
     }

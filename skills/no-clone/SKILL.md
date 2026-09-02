@@ -15,6 +15,9 @@ Use no-clone to request secret delivery by name while keeping secret values out 
 - Never run **no-clone profile render** or **no-clone secret print**; both intentionally create plaintext exposure and require the user to authenticate again.
 - Never use **env**, **printenv**, shell tracing, debug dumps, or equivalent commands when they could print delivered secrets.
 - Use profile names, secret names, transport names, and target variable names only.
+- A fingerprint token is shareable metadata, not a secret value. Agents may
+  run **no-clone secret verify** with a user-provided fingerprint token, but
+  must not attempt to derive, guess, or transform secret values.
 - Remember that no-clone does not redact target stdout or stderr. If the target prints a secret, it can appear in the command result. Do not intentionally invoke commands that print delivered credentials, and do not repeat sensitive output in later messages.
 
 The repository manifest is configuration, not authorization. It may declare multiple profiles and bindings nested under each profile. Do not add hashes, signatures, approval workflows, or automatic unlock behavior.
@@ -109,12 +112,24 @@ Leave these operations to the user unless the user explicitly changes the operat
 - **no-clone init**
 - **no-clone profile create**, **delete**, **render**, **export**, or **import**
 - **no-clone secret set**, **delete**, or **print**
+- **no-clone secret fingerprint** and **no-clone fingerprint rotate-key**
 - **no-clone change-password**
 - **no-clone unlock**
 - **no-clone unlock PROFILE --zero-trust** when the user has not explicitly requested that session policy
 - **no-clone lock** when it would change the user's active sessions unexpectedly
 
 It is safe to suggest the user run **no-clone status** to inspect active profiles. It is also safe to suggest **no-clone lock PROFILE** after the task when the user wants the profile locked.
+
+To verify a user-provided fingerprint, use the named profile and secret only:
+
+~~~text
+no-clone secret verify production deploy-token \
+  --fingerprint nc-fp-v1.<key-id>.<tag>
+~~~
+
+Verification requires the profile to be unlocked, returns only a status, and
+does not deliver the secret. It is safe to run autonomously for zero-trust
+profiles because it does not disclose a credential.
 
 Do not use repository manifests for plaintext rendering or profile export. Rendering is a separate, explicit user-authorized escape hatch.
 
