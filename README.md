@@ -1,30 +1,60 @@
 # no-clone
 
-`no-clone` is a local secret broker for command-line automation. It lets a
-command use credentials without putting their values in arguments, shell
-history, or the process that requested the command.
+`no-clone` is like a password manager for AI agents. You keep API keys,
+deployment tokens, and passwords in an encrypted vault on your machine. When an
+agent needs a credential, it asks for it by name, and `no-clone` delivers it
+directly to the command that needs it. The value does not have to appear in
+chat, the agent's context, command arguments, shell history, or the repository.
 
-The project is early-stage software. It has not had a full independent
-security audit and should be evaluated carefully before use with production
-credentials.
+> ⚠️ **Not a sandbox:** The launched command receives the credential and can
+> still log, copy, or disclose it. `no-clone` does not redact target output or
+> protect against a malicious target command.
 
-## How it works
+> ⚠️ **Early-stage software:** `no-clone` has not had a full independent
+> security audit. Evaluate it carefully before using it with production
+> credentials.
 
-Secrets are stored in an encrypted SQLCipher database. A user unlocks one or
-more profiles, and the local broker keeps those profiles in memory for the
-duration of the session. When a command runs, the broker delivers only the
-secrets declared for that command.
+## Main concepts
 
-- A **vault** stores encrypted profile data on the local machine.
-- A **profile** groups related secrets, such as `production` or `registry`.
-- A **manifest** describes the profiles, secret names, and transports required
-  by a command.
-- The **broker** manages unlocked profiles and launches commands with their
-  credentials.
+| Concept | What it means |
+| --- | --- |
+| **Vault** | The encrypted SQLCipher database stored on the human's machine. Its password is never stored. |
+| **Profile** | A named group of related secrets, such as `production` or `registry`, with its own unlock lifetime. |
+| **Secret** | An opaque value addressed by a non-sensitive name such as `deploy-token`. |
+| **Manifest** | A repository-safe `.no-clone.yaml` file listing the profiles, secret names, and delivery methods a command needs. It never contains values. |
+| **Binding** | The route from one named secret to the target process: a file descriptor, standard input, or an environment variable. |
+| **Broker** | The per-user local background process that holds unlocked profiles in memory and launches target commands. |
+| **Agent skill** | The bundled instructions that teach a compatible agent how to use `no-clone` without handling secret values. |
+| **Fingerprint** | Optional shareable metadata that lets an agent verify a secret against an expected value without retrieving either value. |
 
-The manifest contains names and delivery instructions, never secret values.
+A manifest is configuration, not authorization. Committing one tells an agent
+how to request credentials, but the corresponding profiles must exist in the
+human's local vault and must be explicitly unlocked before use.
 
-## Installation
+## 🤖 Included agent skill
+
+The CLI handles secret storage and delivery. The repository also ships the
+agent-side integration as a ready-to-use skill in
+[`skills/no-clone/`](skills/no-clone/). Its
+[`SKILL.md`](skills/no-clone/SKILL.md) teaches a compatible coding agent to:
+
+- find and read the repository's `.no-clone.yaml` manifest;
+- request credentials by profile and secret name only;
+- run commands through `no-clone run`;
+- leave unlocking and plaintext operations to the human;
+- avoid commands that could print delivered credentials; and
+- handle locked, expired, or missing profiles without asking for secret values.
+
+Install or load the `skills/no-clone/` directory through your agent's normal
+skill mechanism. With agents that support named skills, invoke it directly:
+
+```text
+Use $no-clone to run ./deploy.sh with the repository secret bindings.
+```
+
+## 🚀 Quick start
+
+### 1. Install
 
 Install from a local checkout with Cargo:
 
@@ -32,74 +62,106 @@ Install from a local checkout with Cargo:
 cargo install --path .
 ```
 
-The resulting `no-clone` executable is installed in Cargo's binary directory.
+This installs the `no-clone` executable in Cargo's binary directory.
 
-## Quick start
-
-Create a vault and a profile, then add secrets through hidden prompts:
+### 2. Human: create the vault and add credentials
 
 ```text
 no-clone init
 no-clone profile create production
 no-clone secret set production deploy-token --prompt
-no-clone secret set production database-password --prompt
 ```
 
-Profiles and secret names can be listed without revealing their values:
+`init` creates the encrypted local vault. `secret set --prompt` reads the value
+from a hidden prompt, so it does not enter shell history. A profile's default
+unlock lifetime is 1,800 seconds; set a different value with `--ttl SECONDS`
+when creating it.
+
+Exact arbitrary bytes can be imported from a human-owned file instead:
 
 ```text
-no-clone profile list
-no-clone secret list production
-no-clone status
+no-clone secret set production signing-key --from-file /trusted/path/signing.key
 ```
 
-Create a vault-keyed fingerprint from an independently obtained expected value,
-then give the token to an agent as an expected-value check:
+Do not ask an agent to read that file or paste its contents into chat.
 
-```text
-no-clone secret fingerprint production deploy-token --prompt
-no-clone secret verify production deploy-token \
-  --fingerprint nc-fp-v1.<key-id>.<tag>
+### 3. Project: declare what the command needs
+
+Create `.no-clone.yaml` in the repository:
+
+```yaml
+version: 1
+
+profiles:
+  production:
+    secrets:
+      deploy-token:
+        transport: env
+        target: APP_TOKEN
 ```
 
-Like `secret set`, fingerprint generation requires either `--prompt` for a
-hidden text value or `--from-file PATH` for exact arbitrary bytes. It prompts
-for the vault password and prints only the token. Verification requires the
-profile to be unlocked, returns `match`, `mismatch`, `stale`, or `missing`, and
-never exposes the stored secret. Fingerprints are bound to the vault, profile,
-secret name, and exact expected bytes; they do not expire. Verification is
-autonomous for zero-trust profiles because it does not deliver the secret.
+This says: deliver the local secret named `production/deploy-token` to the
+target process as `APP_TOKEN`. It does not contain the token.
 
-Unlocking is an explicit user action. It starts the per-user broker when
-needed and loads the selected profiles into memory:
+### 4. Human: unlock the profile
 
 ```text
 no-clone unlock production
 ```
 
-A command can then use a repository manifest:
+Unlocking starts the broker when needed, asks for the vault password, and loads
+the selected profile into broker memory until its TTL expires.
+
+### 5. Agent: use the included skill to run the command
+
+Load [`skills/no-clone/`](skills/no-clone/) in a compatible agent and ask it to
+use `$no-clone`. The skill directs the agent to inspect the manifest and run the
+target through the broker:
 
 ```text
 no-clone run --manifest .no-clone.yaml -- ./deploy.sh
 ```
 
-Lock profiles when the work is finished:
+The agent supplies the manifest and command. The broker resolves the declared
+names, starts `./deploy.sh`, and delivers `APP_TOKEN` only to that target process
+tree. The target's exit status, standard output, and standard error are returned
+normally.
+
+When the profile is locked or expired, the command fails without unlocking it.
+The agent should report the profile name and wait for the human to run
+`no-clone unlock`.
+
+### 6. Human: lock the profile when finished
 
 ```text
 no-clone lock production
 ```
 
-Profiles can also be unlocked in zero-trust mode. In that mode, the vault
-password is required again before each delivery:
+Running targets remain responsible for values already delivered to them;
+locking a profile cannot revoke a credential from an existing process.
 
-```text
-no-clone unlock production --zero-trust
-```
+## 👥 Human and agent responsibilities
 
-## Manifests
+The intended division is simple: humans handle secret values and authorization;
+agents handle names, bindings, and commands.
 
-A `.no-clone.yaml` file declares how named secrets should reach the target
-process:
+| Human | Agent |
+| --- | --- |
+| Initialize the vault and manage its password. | Read the manifest and refer to secrets only by profile/name. |
+| Create, delete, import, and export profiles. | Add or update bindings when the required secret name is known. |
+| Set, replace, and delete secret values. | Run targets through `no-clone run`. |
+| Choose standard or zero-trust unlocks. | Report locked or missing profiles instead of attempting to unlock them. |
+| Perform plaintext `print` or `render` operations. | Verify a user-provided fingerprint token when an identity check is needed. |
+| Lock profiles and decide how long they stay unlocked. | Avoid commands that print delivered credentials or dump the target environment. |
+
+In particular, an agent should never ask the human to paste a secret into a
+prompt, argument, environment variable, generated file, or chat message. The
+bundled agent skill encodes these rules so they do not depend on the agent
+improvising the workflow correctly.
+
+## Manifests and transports
+
+A manifest can request multiple secrets from multiple profiles:
 
 ```yaml
 version: 1
@@ -118,53 +180,103 @@ profiles:
   registry:
     secrets:
       password:
-        transport: env
-        target: REGISTRY_PASSWORD
+        transport: stdin
 ```
 
-The supported transports are:
+Choose the narrowest transport the target supports:
 
-| Transport | Use when |
-| --- | --- |
-| `stdin` | The command reads a credential from standard input. |
-| `fd` | The command can read a dedicated inherited file descriptor. Unix only. |
-| `env` | The command requires a named environment variable. |
+| Transport | Manifest form | Use when |
+| --- | --- | --- |
+| `fd` | `transport: fd` plus `target: 3` | The target can read a dedicated inherited file descriptor. Preferred; Unix only. |
+| `stdin` | `transport: stdin` | The target expects the credential on standard input. A run can have only one stdin binding. |
+| `env` | `transport: env` plus `target: NAME` | The target requires a named environment variable. The value must be UTF-8. |
 
-For a one-off command, bindings can be supplied on the command line:
+Environment bindings are scoped to the target process tree. `no-clone` does
+not export them into the agent's shell or write them to a `.env` file.
+
+For a one-off command that does not need a repository manifest, use direct
+bindings:
 
 ```text
 no-clone run production \
   --bind deploy-token=env:APP_TOKEN \
-  --bind database-password=fd:3 \
+  --bind signing-key=fd:3 \
   -- ./deploy.sh
 ```
 
-## Passwords and profiles
+The supported forms are `SECRET=stdin`, `SECRET=env:VARIABLE_NAME`, and
+`SECRET=fd:NUMBER`. Values never belong in `--bind`.
 
-The vault password is never stored. Each profile has its own expiration time,
-and expired profiles are removed from the broker's active memory. Running
-commands do not unlock profiles automatically.
+## Unlock modes
 
-Change the vault password with:
-
-```text
-no-clone change-password
-```
-
-The command verifies the current password and preserves the vault contents.
-
-Profiles can be transferred between trusted installations as encrypted
-bundles:
+### Standard
 
 ```text
-no-clone profile export production --output production.no-clone
-no-clone profile import production.no-clone --as production
+no-clone unlock production
 ```
 
-## Rendering and security
+The broker may deliver that profile's secrets to matching requests until the
+profile's TTL expires or the human locks it. Override the TTL for one session
+with `--ttl SECONDS`.
 
-Direct process delivery is the preferred workflow. Rendering is available for
-applications that require a configuration file:
+### Zero trust
+
+```text
+no-clone unlock production --zero-trust
+```
+
+The profile is still loaded for a bounded session, but every command that would
+receive one of its secrets requires the vault password again. `no-clone` shows
+the requested profiles and command before prompting, giving the human a fresh
+authorization point for each delivery.
+
+An agent must stop at that prompt and let the human inspect and authorize the
+command. Fingerprint verification does not deliver a credential, so it does not
+trigger a zero-trust authorization prompt.
+
+Inspect active sessions without revealing secret values:
+
+```text
+no-clone status
+no-clone profile list
+no-clone secret list production
+```
+
+## Verify a secret without revealing it
+
+Sometimes the question is not “what is the value?” but “is the stored value the
+one I expect?” A human can create a vault-keyed fingerprint from an expected
+value obtained through an independent trusted channel:
+
+```text
+no-clone secret fingerprint production deploy-token --prompt
+```
+
+The command prints a token shaped like `nc-fp-v1.<key-id>.<tag>`. The token is
+shareable metadata, not a credential. An agent can verify it against the stored
+secret by name:
+
+```text
+no-clone secret verify production deploy-token \
+  --fingerprint nc-fp-v1.<key-id>.<tag>
+```
+
+Verification returns `match`, `mismatch`, `stale`, or `missing` and never
+delivers the secret. Fingerprints are bound to the vault, profile, secret name,
+and exact expected bytes. They do not expire, but rotating the vault fingerprint
+key permanently makes all existing tokens stale:
+
+```text
+no-clone fingerprint rotate-key
+```
+
+Fingerprint creation and key rotation are human-only operations because they
+require trusted input or change verification state.
+
+## Plaintext escape hatches and profile transfer
+
+Direct process delivery is the preferred workflow. For applications that can
+only read configuration files, a human can explicitly render a profile:
 
 ```text
 no-clone profile render production --format dotenv --output .env
@@ -172,41 +284,73 @@ no-clone profile render production --format json --output secrets.json
 no-clone profile render production --format yaml --stdout
 ```
 
-Rendering and single-secret printing require a fresh vault-password prompt:
+A human can also print one secret:
 
 ```text
 no-clone secret print production database-password
 ```
 
-Fingerprint keys can be rotated as an explicit recovery action. Rotation
-requires a warning confirmation and the vault password, and permanently
-invalidates every previously generated fingerprint:
+These operations require a fresh vault-password prompt. Their output is
+plaintext: protect it, keep it out of version control, and do not perform it in
+an agent-controlled session.
+
+Profiles can be moved between trusted installations as password-protected,
+encrypted bundles:
 
 ```text
-no-clone fingerprint rotate-key
+no-clone profile export production --output production.no-clone
+no-clone profile import production.no-clone --as production
 ```
 
-Rendered files contain plaintext credentials and should be protected and kept
-out of version control.
+Change the vault master password without replacing its contents:
 
-The broker uses protected per-user local IPC. Environment variables are set
-only for the target process tree. After a credential has been delivered,
-`no-clone` cannot stop the target from logging, copying, or disclosing it, and
-it does not redact target stdout or stderr. Fingerprints are keyed HMAC tags,
-not credentials; they are safe to share with an agent but cannot be used to
-retrieve a secret or authenticate to the underlying service.
+```text
+no-clone change-password
+```
+
+## 🛡️ Security boundaries
+
+`no-clone` is designed to prevent accidental credential exposure in the
+agent/request path:
+
+- secret values are encrypted at rest in a local SQLCipher vault;
+- unlocked profiles live in the per-user broker's memory for a bounded time;
+- repository manifests and CLI bindings contain names and delivery instructions
+  only;
+- the local broker accepts clients from the current OS user on Unix; and
+- credentials are attached only while launching the requested target process.
+
+It deliberately does **not** guarantee that:
+
+- a target process will keep the delivered credential confidential;
+- target stdout or stderr is free of credentials;
+- locking can revoke a value already delivered to a running process;
+- another process with sufficient access to the same account or machine cannot
+  inspect or interfere with local processes; or
+- a malicious agent allowed to choose arbitrary commands cannot request a
+  command that exfiltrates a delivered credential.
+
+Use zero-trust mode when a human should inspect every credential-bearing
+command, and only authorize targets you trust.
 
 ## Development
 
-Run the test suite with:
+The project uses the Rust toolchain and Cargo. Build the CLI or run it directly
+from the checkout:
+
+```text
+cargo build
+cargo run -- --help
+```
+
+Before submitting a change, run the test, formatting, and lint checks:
 
 ```text
 cargo test
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
 ```
-
-The repository also contains the integration guide used by compatible command
-automation tools at [skills/no-clone/SKILL.md](skills/no-clone/SKILL.md).
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [`LICENSE`](LICENSE).
