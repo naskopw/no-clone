@@ -53,21 +53,22 @@ no-clone secret list production
 no-clone status
 ```
 
-Create a vault-keyed fingerprint for an existing secret and give the token to
-an agent as an expected-value check:
+Create a vault-keyed fingerprint from an independently obtained expected value,
+then give the token to an agent as an expected-value check:
 
 ```text
-no-clone secret fingerprint production deploy-token
+no-clone secret fingerprint production deploy-token --prompt
 no-clone secret verify production deploy-token \
   --fingerprint nc-fp-v1.<key-id>.<tag>
 ```
 
-Fingerprint generation prompts for the vault password and prints only the
-token. Verification requires the profile to be unlocked, returns `match`,
-`mismatch`, `stale`, or `missing`, and never exposes the secret. Fingerprints
-are bound to the vault, profile, secret name, and exact secret bytes; they do
-not expire. Verification is autonomous for zero-trust profiles because it
-does not deliver the secret.
+Like `secret set`, fingerprint generation requires either `--prompt` for a
+hidden text value or `--from-file PATH` for exact arbitrary bytes. It prompts
+for the vault password and prints only the token. Verification requires the
+profile to be unlocked, returns `match`, `mismatch`, `stale`, or `missing`, and
+never exposes the stored secret. Fingerprints are bound to the vault, profile,
+secret name, and exact expected bytes; they do not expire. Verification is
+autonomous for zero-trust profiles because it does not deliver the secret.
 
 Unlocking is an explicit user action. It starts the per-user broker when
 needed and loads the selected profiles into memory:

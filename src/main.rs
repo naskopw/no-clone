@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use fingerprint::VerificationStatus;
 use manifest::{Manifest, ProfileManifest, parse_cli_binding};
 use vault::{Vault, VaultSecret, default_vault_path};
@@ -108,13 +108,13 @@ struct ProfileNameArgs {
 enum SecretCommand {
     /// Create or replace a secret without printing its value.
     #[command(alias = "add")]
-    Set(SecretSetArgs),
+    Set(SecretValueArgs),
     /// List secret names without revealing values.
     List(ProfileNameArgs),
     /// Delete a secret.
     Delete(SecretNameArgs),
-    /// Generate a vault-keyed fingerprint for a stored secret.
-    Fingerprint(SecretNameArgs),
+    /// Generate a vault-keyed fingerprint for an externally supplied expected value.
+    Fingerprint(SecretValueArgs),
     /// Verify a vault-keyed fingerprint without revealing the secret.
     Verify(SecretVerifyArgs),
     /// Explicitly print one secret after a fresh vault-password prompt.
@@ -122,16 +122,22 @@ enum SecretCommand {
 }
 
 #[derive(Debug, Args)]
-struct SecretSetArgs {
+#[command(group(
+    ArgGroup::new("value_source")
+        .required(true)
+        .multiple(false)
+        .args(["prompt", "from_file"])
+))]
+struct SecretValueArgs {
     /// Profile that owns the secret.
     profile: String,
     /// Secret name referenced by manifests.
     name: String,
     /// Read the value from a hidden interactive prompt.
-    #[arg(long, conflicts_with = "from_file")]
+    #[arg(long)]
     prompt: bool,
     /// Import the value as bytes from a user-owned file.
-    #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
+    #[arg(long, value_name = "PATH")]
     from_file: Option<PathBuf>,
 }
 
@@ -333,19 +339,7 @@ fn secret_command(command: SecretCommand) -> Result<()> {
         SecretCommand::Set(args) => {
             validate_name(&args.profile, "profile")?;
             validate_name(&args.name, "secret")?;
-
-            let value: Zeroizing<Vec<u8>> = match (args.prompt, args.from_file) {
-                (true, None) => {
-                    prompt_secret(&format!("Value for {}/{}", args.profile, args.name))?
-                }
-                (false, Some(path)) => {
-                    Zeroizing::new(std::fs::read(&path).with_context(|| {
-                        format!("failed to read secret file {}", path.display())
-                    })?)
-                }
-                (false, None) => bail!("provide either --prompt or --from-file"),
-                (true, Some(_)) => unreachable!("clap enforces mutually exclusive arguments"),
-            };
+            let value = read_secret_value(&args, "Value for")?;
 
             let mut vault = open_vault()?;
             vault.put_secret(&args.profile, &args.name, &value)?;
@@ -388,15 +382,28 @@ fn fingerprint_command(command: FingerprintCommand) -> Result<()> {
     }
 }
 
-fn fingerprint_secret(args: SecretNameArgs) -> Result<()> {
+fn fingerprint_secret(args: SecretValueArgs) -> Result<()> {
     validate_name(&args.profile, "profile")?;
     validate_name(&args.name, "secret")?;
+    let expected_value = read_secret_value(&args, "Expected value for")?;
     let vault = open_vault()?;
     let key = vault.fingerprint_key()?;
-    let secret = vault.get_secret(&args.profile, &args.name)?;
-    let token = fingerprint::token_for(&key, &args.profile, &args.name, &secret.value);
+    let token = fingerprint::token_for(&key, &args.profile, &args.name, &expected_value);
     println!("{token}");
     Ok(())
+}
+
+fn read_secret_value(args: &SecretValueArgs, prompt_label: &str) -> Result<Zeroizing<Vec<u8>>> {
+    match (args.prompt, args.from_file.as_ref()) {
+        (true, None) => prompt_secret(&format!("{prompt_label} {}/{}", args.profile, args.name)),
+        (false, Some(path)) => {
+            Ok(Zeroizing::new(std::fs::read(path).with_context(|| {
+                format!("failed to read secret file {}", path.display())
+            })?))
+        }
+        (false, None) => bail!("provide either --prompt or --from-file"),
+        (true, Some(_)) => unreachable!("clap enforces mutually exclusive arguments"),
+    }
 }
 
 fn verify_secret(args: SecretVerifyArgs) -> Result<()> {
@@ -844,5 +851,51 @@ mod tests {
             (String::from("database_password"), String::from("two")),
         ]);
         assert!(render_dotenv(&values).is_err());
+    }
+
+    #[test]
+    fn secret_value_commands_require_one_explicit_input_source() {
+        for command in ["set", "fingerprint"] {
+            assert!(
+                Cli::try_parse_from(["no-clone", "secret", command, "production", "token"])
+                    .is_err()
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "no-clone",
+                    "secret",
+                    command,
+                    "production",
+                    "token",
+                    "--prompt",
+                ])
+                .is_ok()
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "no-clone",
+                    "secret",
+                    command,
+                    "production",
+                    "token",
+                    "--from-file",
+                    "expected.bin",
+                ])
+                .is_ok()
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "no-clone",
+                    "secret",
+                    command,
+                    "production",
+                    "token",
+                    "--prompt",
+                    "--from-file",
+                    "expected.bin",
+                ])
+                .is_err()
+            );
+        }
     }
 }

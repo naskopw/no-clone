@@ -3,20 +3,25 @@
 ## Overview
 
 Vault-keyed secret fingerprints let a user give an LLM a safe, opaque
-identifier for a stored secret. An agent can then verify that an unlocked
-secret still has the expected identity without receiving its value or a
-brute-forceable unkeyed hash.
+identifier for an independently obtained expected secret. An agent can then
+verify that an unlocked stored secret matches that expected value without
+receiving either value or a brute-forceable unkeyed hash.
 
 Fingerprints never expire. They are bound to one vault, profile name, secret
-name, and exact secret bytes. They remain valid through vault password changes
-and become stale after fingerprint-key rotation.
+name, and exact expected bytes. They remain valid through vault password
+changes and become stale after fingerprint-key rotation.
 
 ## Requirements
 
 ### Functional
 
-- `no-clone secret fingerprint PROFILE SECRET` prompts for the vault password,
-  fingerprints the stored secret, and prints only a token to stdout.
+- `no-clone secret fingerprint PROFILE SECRET --prompt` reads an expected text
+  value from a hidden prompt, prompts for the vault password, and prints only a
+  token to stdout.
+- `no-clone secret fingerprint PROFILE SECRET --from-file PATH` reads exact
+  expected bytes from a user-owned file and prints only a token to stdout.
+- Fingerprint generation requires exactly one of `--prompt` or `--from-file`,
+  matching the input contract of `no-clone secret set`.
 - `no-clone secret verify PROFILE SECRET --fingerprint TOKEN` asks the broker
   for a match result without prompting for a password or exposing the secret.
 - Verification works autonomously for standard and zero-trust profiles once
@@ -26,8 +31,8 @@ and become stale after fingerprint-key rotation.
   fingerprints.
 - Rotation has no non-interactive confirmation override.
 - Fingerprints support arbitrary secret bytes and exact-byte matching.
-- GUI support, human candidate comparison, external fingerprint input, and
-  repository manifest configuration are out of scope.
+- GUI support, direct human-only comparison, and repository manifest
+  configuration are out of scope.
 
 ### Security and non-functional
 
@@ -44,13 +49,22 @@ and become stale after fingerprint-key rotation.
 
 ## User Experience and Behavior
 
-Generate a token for the current stored value:
+Generate a token from an independently obtained expected value:
 
 ```text
-no-clone secret fingerprint production deploy-token
+no-clone secret fingerprint production deploy-token --prompt
 ```
 
-The command prompts for the vault password and prints only:
+For binary values or values whose trailing bytes matter, read the expected
+value from a file:
+
+```text
+no-clone secret fingerprint production deploy-token \
+  --from-file /trusted/path/to/expected-token
+```
+
+The command reads the expected value, prompts for the vault password, and
+prints only:
 
 ```text
 nc-fp-v1.<key-id>.<tag>
@@ -84,7 +98,7 @@ nc-fp-v1.<base64url-key-id>.<base64url-hmac-tag>
 
 The tag is an HMAC-SHA-256 over a fixed v1 domain separator, the key-generation
 ID, and unambiguous 64-bit length-prefixed values for the profile name, secret
-name, and secret bytes. HMAC verification uses the cryptographic library’s
+name, and expected bytes. HMAC verification uses the cryptographic library’s
 constant-time verification routine.
 
 HMAC-SHA-256 is used instead of a raw SHA-512 digest because the vault-held
@@ -136,24 +150,27 @@ verification.
 - A token from another vault is reported as stale because its key-generation
   ID is not recognized by the current vault.
 - Rotating a key does not change secret values or lock profiles.
-- Re-setting a secret to identical bytes preserves its fingerprint.
+- A fingerprint can be created before the named secret exists; verification
+  reports `missing` until the secret is stored.
+- Re-setting a secret to the expected bytes makes the fingerprint match.
 - Profile export/import does not preserve fingerprint compatibility.
 
 ## Testing
 
-Tests cover deterministic fingerprints, arbitrary bytes, exact-byte behavior,
-profile/name binding, malformed tokens, all status results, locked and expired
-profiles, zero-trust verification, password-change stability, immediate
-rotation invalidation, cancellation/failure behavior, and export/import key
-separation. Tests also ensure fingerprint generation is token-only and that
-verification never exposes secret material.
+Tests cover deterministic fingerprints, arbitrary external bytes, exact-byte
+behavior, profile/name binding, malformed tokens, all status results, locked
+and expired profiles, zero-trust verification, password-change stability,
+immediate rotation invalidation, cancellation/failure behavior, and
+export/import key separation. Tests also ensure fingerprint generation
+requires an explicit input source, is token-only, and that verification never
+exposes secret material.
 
 ## Future Considerations
 
 The following are intentionally deferred:
 
-- Human candidate comparison (`secret compare`), returning `match`,
-  `different`, or `missing`.
+- Direct human-only comparison (`secret compare`), returning `match`,
+  `different`, or `missing` without creating a token.
 - GUI support.
 - Fingerprint expiry.
 - Non-interactive key rotation.
