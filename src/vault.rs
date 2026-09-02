@@ -117,7 +117,11 @@ impl Vault {
         // remain undetected until the first real query.
         let _: i64 = connection
             .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
-            .context("could not unlock vault; check the password")?;
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "could not unlock encrypted database: incorrect password or invalid vault/bundle file"
+                )
+            })?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
 
         Ok(Self {
@@ -329,6 +333,9 @@ impl Vault {
 
 fn configure_connection(connection: &Connection, password: &str) -> Result<()> {
     connection
+        .pragma_update(None, "cipher_log_level", "NONE")
+        .context("failed to configure vault diagnostics")?;
+    connection
         .pragma_update(None, "key", password)
         .context("failed to configure vault encryption")?;
     connection
@@ -394,7 +401,11 @@ mod tests {
             assert_eq!(secret.value, vec![0, 1, 2, 255]);
         }
 
-        assert!(Vault::open(&path, "wrong password").is_err());
+        let error = Vault::open(&path, "wrong password").err().unwrap();
+        assert_eq!(
+            format!("{error:#}"),
+            "could not unlock encrypted database: incorrect password or invalid vault/bundle file"
+        );
         fs::remove_file(path).unwrap();
     }
 
