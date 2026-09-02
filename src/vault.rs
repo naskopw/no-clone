@@ -7,6 +7,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 use zeroize::Zeroize;
 
 use crate::fingerprint::{FingerprintKey, KEY_ID_LENGTH, KEY_LENGTH};
@@ -51,14 +52,14 @@ pub struct Vault {
     connection: Connection,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct ProfileSummary {
     pub name: String,
     pub ttl_seconds: i64,
     pub secret_count: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct SecretSummary {
     pub name: String,
     pub byte_len: usize,

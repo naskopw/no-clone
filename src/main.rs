@@ -1,5 +1,6 @@
 mod broker;
 mod fingerprint;
+mod gui;
 mod manifest;
 mod vault;
 
@@ -65,6 +66,9 @@ enum Command {
         #[arg(long)]
         foreground: bool,
     },
+    /// Internal machine-readable administration protocol for the desktop GUI.
+    #[command(hide = true)]
+    Gui,
 }
 
 #[derive(Debug, Subcommand)]
@@ -249,6 +253,7 @@ fn main() -> Result<()> {
             }
             broker::run_foreground()
         }
+        Command::Gui => gui::run(),
     }
 }
 
